@@ -1,0 +1,17 @@
+[Unit]
+Description=Raspberry Pi QR BLE reader
+After=bluetooth.service network.target
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/Tote/Rspi_QR_BLE
+Environment=PYTHONUNBUFFERED=1
+Environment=BLE_DEVICE_NAME=QR-Reader
+ExecStart=/home/pi/Tote/Rspi_QR_BLE/.venv/bin/python -m rspi_qr_ble
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
