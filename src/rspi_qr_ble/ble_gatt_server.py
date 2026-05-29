@@ -290,11 +290,6 @@ class BLEServer:
                 if interface != GATT_CHRC_IFACE:
                     raise InvalidArgsException()
                 return self.get_properties()[GATT_CHRC_IFACE]
-            @dbus.service.method(DBUS_PROP_IFACE, in_signature="s", out_signature="a{sv}")
-            def GetAll(self, interface):
-                if interface != GATT_CHRC_IFACE:
-                    raise InvalidArgsException()
-                return self.get_properties()[GATT_CHRC_IFACE]
 
             @dbus.service.method(GATT_CHRC_IFACE, in_signature="a{sv}", out_signature="ay")
             def ReadValue(self, _options):

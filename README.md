@@ -1,157 +1,104 @@
 # Rspi_QR_BLE
 
-Reemplazo compatible del proyecto `QR-Reader-BLE` para Raspberry Pi Zero 2 + camara.
+Servidor BLE GATT para Raspberry Pi Zero 2 que lee códigos QR por cámara y los entrega al ESP32 (`tote_inbound` / `tote_outbound`) mediante el protocolo `GET → NOTIFY → ACK`.
 
-Este proyecto expone el mismo contrato BLE que el ESP32:
+Reemplaza al proyecto anterior `QR-Reader-BLE`, manteniendo el mismo contrato BLE para no modificar el firmware del ESP32.
 
-- Nombre BLE por defecto: `QR-Reader`
-- Service UUID: `12345678-1234-1234-1234-123456789abc`
-- QR data characteristic: `12345678-1234-1234-1234-123456789abd`
-- Request characteristic: `12345678-1234-1234-1234-123456789abe`
+---
 
-Semantica compatible:
+## Contrato BLE
 
-- El cliente escribe `GET` en la characteristic de request.
-- El servidor responde por `NOTIFY` en la characteristic de data.
-- Si hay QR en buffer, envia el texto del QR.
-- Si no hay QR en buffer, envia `NO_QR`.
-- El cliente escribe `ACK` para confirmar que ya proceso el QR y limpiar el buffer.
-- Si no llega `ACK` en `ACK_TIMEOUT_MS`, el QR queda rearmado para el siguiente `GET`.
+| Parámetro | Valor |
+|---|---|
+| Nombre BLE | `QR-Reader` (configurable) |
+| Service UUID | `12345678-1234-1234-1234-123456789abc` |
+| Data characteristic | `12345678-1234-1234-1234-123456789abd` — READ + NOTIFY |
+| Request characteristic | `12345678-1234-1234-1234-123456789abe` — WRITE |
 
-## Arquitectura elegida
+### Protocolo GET / ACK
 
-Para Raspberry Pi Zero 2 use una implementacion Linux-native:
+```
+ESP32 (central)               Pi (peripheral)
+     │                              │
+     │── write "GET" ─────────────► │
+     │                              │ (busca QR en buffer)
+     │ ◄──────── notify "TOTE001" ──│   o "NO_QR" si vacío
+     │                              │
+     │── write "ACK" ─────────────► │  (limpia buffer)
+     │                              │
+```
 
-- **BLE peripheral/GATT server**: `bluez` sobre D-Bus (`python3-dbus` + `python3-gi`)
-- **Camara**: `Picamera2` en Raspberry Pi OS Bookworm/Bullseye
-- **QR detection**: `OpenCV QRCodeDetector`
+- Si el ESP32 no envía `ACK` dentro de `ACK_TIMEOUT_MS` (por defecto 15 s), el QR queda **rearmado** para el siguiente `GET`.
+- El ESP32 (`tote_inbound`) realiza un `GET` cada 3 segundos mientras está en estado `WAITING_TOTE_ID`.
 
-Razones:
+---
 
-- Mantiene compatibilidad BLE real con el cliente ESP32 actual.
-- Evita depender de librerias BLE de Python menos estables para modo peripheral.
-- `Picamera2` es la ruta oficial moderna en Raspberry Pi OS.
-- `QRCodeDetector` evita depender de `zbar`/`pyzbar`.
+## Arquitectura
 
-## Estructura
-
-```text
+```
 Rspi_QR_BLE/
-├── pyproject.toml
-├── requirements-dev.txt
-├── README.md
-├── tools/
-│   ├── ble_tester.py
-│   └── qr_debug_live.py
+├── src/rspi_qr_ble/
+│   ├── app.py              # Punto de entrada: arranca scanner + servidor BLE
+│   ├── config.py           # Settings leídas desde variables de entorno
+│   ├── camera_scanner.py   # Hilo de captura: Picamera2 o OpenCV
+│   ├── scan_gate.py        # Deduplicador: evita re-emitir el mismo QR por frames
+│   ├── qr_buffer.py        # Buffer thread-safe con lógica de ACK y timeout
+│   ├── ble_gatt_server.py  # Servidor GATT sobre BlueZ D-Bus
+│   ├── __main__.py
+│   └── __init__.py
 ├── systemd/
 │   └── rspi-qr-ble.service
-└── src/
-    └── rspi_qr_ble/
-        ├── __init__.py
-        ├── __main__.py
-        ├── app.py
-        ├── ble_gatt_server.py
-        ├── camera_scanner.py
-        ├── config.py
-        ├── qr_buffer.py
-        └── scan_gate.py
+├── tools/
+│   ├── ble_tester.py       # Simula un cliente BLE (ESP32) desde otra máquina
+│   └── qr_debug_live.py    # Stream MJPEG o ventana con overlay de detección QR
+├── tests/
+│   ├── test_qr_buffer.py
+│   └── test_scan_gate.py
+└── pyproject.toml
 ```
 
-## Compatibilidad con el ESP actual
+### Flujo interno
 
-Este proyecto fue hecho para ser reemplazable frente a los clientes BLE del repo (`tote_inbound` y `tote_outbound`):
-
-- mismo nombre BLE por defecto
-- mismos UUIDs
-- mismo `GET` / `ACK`
-- misma respuesta `NO_QR`
-- mismo patron de "buffer de ultimo QR"
-
-Tambien soporta cambiar el nombre BLE por variable de entorno para el caso outbound:
-
-```bash
-BLE_DEVICE_NAME=QR-Reader-OUT
+```
+CameraScanner (hilo) → ScanGate → QRBuffer.store_scan()
+                                        │
+BLEServer (GLib MainLoop)               │
+  ├─ recibe "GET"  → QRBuffer.request_payload() → notify al central
+  └─ recibe "ACK"  → QRBuffer.acknowledge()
+                                        │
+                        (timeout) → QRBuffer.rearm_if_timed_out()
 ```
 
-## Comportamiento importante frente a una camara
+**ScanGate** resuelve el problema de cámara vs. lector UART: la misma etiqueta QR puede estar visible durante cientos de frames. El `ScanGate` solo emite un evento al buffer cuando el código aparece por primera vez, y lo vuelve a habilitar solo después de que desaparece de cámara durante `QR_DISAPPEAR_RESET_MS`.
 
-Con UART, el lector GM69Pro entrega un evento por escaneo.
+---
 
-Con camara, el mismo QR puede aparecer durante muchos frames seguidos. Para que se comporte como el ESP:
+## Variables de entorno
 
-- el proyecto **no vuelve a bufferizar el mismo QR en cada frame**
-- el mismo QR solo vuelve a emitirse si desaparece de camara durante un tiempo configurable
+Todas tienen valor por defecto; en producción se configuran en el unit de systemd.
 
-Eso evita que:
+| Variable | Default | Descripción |
+|---|---|---|
+| `BLE_DEVICE_NAME` | `QR-Reader` | Nombre BLE anunciado. Usar `QR-Reader-OUT` para outbound. |
+| `BLE_SERVICE_UUID` | `12345678-...abc` | UUID del servicio GATT |
+| `BLE_QR_DATA_CHAR_UUID` | `12345678-...abd` | UUID de la characteristic de datos |
+| `BLE_QR_REQ_CHAR_UUID` | `12345678-...abe` | UUID de la characteristic de request |
+| `ACK_TIMEOUT_MS` | `15000` | Ms sin ACK antes de rearmar el QR |
+| `SCAN_INTERVAL_MS` | `120` | Intervalo entre frames de cámara (ms) |
+| `QR_DISAPPEAR_RESET_MS` | `1200` | Ms sin ver el QR para considerarlo nuevo |
+| `CAMERA_WIDTH` | `1280` | Resolución horizontal de captura |
+| `CAMERA_HEIGHT` | `720` | Resolución vertical de captura |
+| `CAMERA_INDEX` | `0` | Índice de cámara OpenCV (solo si `CAMERA_BACKEND=opencv`) |
+| `CAMERA_BACKEND` | `picamera2` | `picamera2` (Pi CSI) o `opencv` (USB/webcam) |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
-- el buffer se sobrescriba miles de veces
-- el `ACK` quede inutil
-- un QR quieto enfrente de la camara se reprograme continuamente
+---
 
-## Configuracion por entorno
+## Despliegue en Raspberry Pi Zero 2
 
-Variables principales:
+Probado en Raspberry Pi OS Bookworm con cámara CSI y Bluetooth integrado.
 
-```bash
-BLE_DEVICE_NAME=QR-Reader
-BLE_SERVICE_UUID=12345678-1234-1234-1234-123456789abc
-BLE_QR_DATA_CHAR_UUID=12345678-1234-1234-1234-123456789abd
-BLE_QR_REQ_CHAR_UUID=12345678-1234-1234-1234-123456789abe
-
-ACK_TIMEOUT_MS=15000
-SCAN_INTERVAL_MS=120
-QR_DISAPPEAR_RESET_MS=1200
-
-CAMERA_WIDTH=1280
-CAMERA_HEIGHT=720
-CAMERA_INDEX=0
-CAMERA_BACKEND=picamera2
-
-LOG_LEVEL=INFO
-```
-
-## Desarrollo local
-
-Si quieres probar el comportamiento BLE desde otra maquina Linux:
-
-```bash
-python tools/ble_tester.py
-```
-
-## Herramienta de debug visual en vivo
-
-Para depurar como detecta y decodifica QR en tiempo real, usa:
-
-```bash
-python tools/qr_debug_live.py --backend picamera2 --mode mjpeg --port 8081
-```
-
-Abre desde tu laptop:
-
-```text
-http://IP_DE_LA_PI:8081
-```
-
-La vista muestra:
-
-- recuadro del QR detectado
-- texto decodificado sobre la imagen
-- FPS y numero de detecciones
-- logs en consola cuando aparece un QR nuevo
-
-Si tienes monitor conectado a la Pi, tambien puedes usar ventana local:
-
-```bash
-python tools/qr_debug_live.py --backend picamera2 --mode window
-```
-
-Pulsa `q` para salir.
-
-## Pasos para correrlo en tu Raspberry Pi Zero 2
-
-Asumo Raspberry Pi OS Bookworm o Bullseye, Bluetooth integrado funcional y una camara CSI soportada por `Picamera2`.
-
-1. Instala paquetes del sistema:
+### 1. Dependencias del sistema
 
 ```bash
 sudo apt update
@@ -161,26 +108,25 @@ sudo apt install -y \
   python3-venv
 ```
 
-2. Verifica que la camara funcione:
+### 2. Verificaciones previas
 
 ```bash
+# Cámara
 rpicam-hello -t 3000
-```
 
-3. Verifica que Bluetooth este activo:
-
-```bash
+# Bluetooth
 bluetoothctl show
 ```
 
-4. Si BlueZ no te deja registrar advertising/GATT custom, habilita modo experimental en `bluetoothd`.
-   En Raspberry Pi OS normalmente esto se hace creando un override del servicio:
+### 3. Habilitar modo experimental en BlueZ
+
+Necesario para registrar un GATT server y advertisement personalizados.
 
 ```bash
 sudo systemctl edit bluetooth
 ```
 
-Y agrega:
+Añadir:
 
 ```ini
 [Service]
@@ -188,48 +134,33 @@ ExecStart=
 ExecStart=/usr/libexec/bluetooth/bluetoothd -E
 ```
 
-Si tu sistema usa otra ruta de `bluetoothd`, ajustala. Luego:
-
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl restart bluetooth
 ```
 
-5. Entra al proyecto:
+### 4. Instalar el paquete
 
 ```bash
-cd /ruta/a/Tote/Rspi_QR_BLE
-```
-
-6. Crea un entorno virtual que vea los paquetes `apt` del sistema:
-
-```bash
+cd /home/pi/Tote/Rspi_QR_BLE
 python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 pip install -e .
 ```
 
-Si tambien quieres usar el tester BLE de este proyecto desde la misma Pi o desde otra maquina Python:
-
-```bash
-pip install -r requirements-dev.txt
-```
-
-7. Ejecuta el servidor:
+### 5. Probar manualmente
 
 ```bash
 python -m rspi_qr_ble
 ```
 
-8. Si quieres usarlo como reemplazo del lector outbound:
+Para el canal outbound:
 
 ```bash
 BLE_DEVICE_NAME=QR-Reader-OUT python -m rspi_qr_ble
 ```
 
-9. Prueba desde el tester BLE o desde `tote_inbound` / `tote_outbound`.
-
-10. Si quieres dejarlo como servicio:
+### 6. Instalar como servicio systemd
 
 ```bash
 sudo cp systemd/rspi-qr-ble.service /etc/systemd/system/
@@ -237,11 +168,59 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now rspi-qr-ble.service
 ```
 
-## Notas
+Verificar:
 
-- No pude probar hardware real de camara/BLE desde este workspace.
-- El contrato BLE si quedo alineado con `QR-Reader-BLE`.
-- La parte mas sensible en campo probablemente sera:
-  - enfoque/exposicion de la camara
-  - iluminacion
-  - permisos/flags de BlueZ para advertising/GATT
+```bash
+sudo systemctl status rspi-qr-ble
+journalctl -u rspi-qr-ble -f
+```
+
+---
+
+## Herramientas de desarrollo
+
+### `tools/ble_tester.py` — Simula el cliente ESP32
+
+Conecta como central BLE, envía `GET` y muestra la respuesta. Útil para validar el servidor sin necesidad del hardware ESP32.
+
+```bash
+pip install bleak>=0.22
+python tools/ble_tester.py
+```
+
+### `tools/qr_debug_live.py` — Stream visual de detección QR
+
+Muestra en tiempo real el overlay de detección (recuadro, texto decodificado, FPS).
+
+Stream MJPEG desde laptop/navegador:
+
+```bash
+python tools/qr_debug_live.py --backend picamera2 --mode mjpeg --port 8081
+# Abrir en navegador: http://<IP_DE_LA_PI>:8081
+```
+
+Ventana local (si hay monitor conectado a la Pi):
+
+```bash
+python tools/qr_debug_live.py --backend picamera2 --mode window
+# Pulsar 'q' para salir
+```
+
+---
+
+## Tests
+
+```bash
+pip install pytest
+pytest tests/
+```
+
+Los tests cubren `QRBuffer` y `ScanGate` (lógica pura, sin hardware).
+
+---
+
+## Notas de campo
+
+- El ajuste más crítico en producción es el enfoque/exposición de la cámara y la iluminación del área de escaneo.
+- Si BlueZ rechaza el registro del GATT, revisar que el flag `-E` esté activo (`journalctl -u bluetooth`).
+- El usuario que corre el servicio debe pertenecer al grupo `bluetooth` para acceder al D-Bus del sistema.
